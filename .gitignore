@@ -2,4 +2,5 @@ reference_wav/
 src/data/
 logs/
 Pop1K7.zip
+cache/
 
