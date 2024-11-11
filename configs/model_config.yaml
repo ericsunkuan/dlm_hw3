@@ -1,5 +1,5 @@
 data:
-  batch_size: 16
+  batch_size: 8
   data_dir: "src/data/Pop1K7/midi_analyzed"
   num_workers: 4
   max_seq_len: 512

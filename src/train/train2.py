@@ -179,16 +179,17 @@ class EnhancedTrainer:
     def train_epoch(self, epoch: int, stage: dict):
         self.model.train()
         total_loss = 0
+        mems = None
         
         for batch_idx, batch in enumerate(tqdm(self.train_dataloader)):
             input_ids = batch['input_ids'].to(self.device)
             labels = batch['labels'].to(self.device)
             
             # Forward pass
-            with torch.cuda.amp.autocast():
-                logits, _ = self.model(input_ids)
-                loss = self.criterion(logits.view(-1, logits.size(-1)), labels.view(-1))
-                
+            with torch.amp.autocast('cuda'):
+                logits, mems = self.model(input_ids, mems)
+                loss = self.criterion(logits.reshape(-1, logits.size(-1)), labels.reshape(-1))
+            
             # Backward pass
             self.scaler.scale(loss).backward()
             

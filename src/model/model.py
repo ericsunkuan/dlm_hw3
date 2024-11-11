@@ -60,7 +60,8 @@ class MusicTransformerXL(nn.Module):
                 d_model=d_model,
                 n_head=n_head,
                 d_ff=d_ff,
-                dropout=dropout
+                dropout=dropout,
+                mem_len=mem_len
             ) for _ in range(n_layers)
         ])
         
@@ -81,20 +82,29 @@ class MusicTransformerXL(nn.Module):
             module.weight.data.fill_(1.0)
             
     def forward(self, x, mems=None):
+        batch_size = x.size(0)
+        
         # Initialize mems if None
         if mems is None:
-            mems = [torch.empty(0, device=x.device) for _ in range(len(self.transformer_layers))]
+            mems = [torch.empty(0, batch_size, self.d_model, device=x.device) 
+                   for _ in range(len(self.transformer_layers))]
         
-        # Get embeddings
+        # Get embeddings [batch, seq_len, d_model]
         hidden = self.token_embedding(x)
         hidden = self.dropout(hidden)
+        
+        # Transpose to [seq_len, batch, d_model] for attention
+        hidden = hidden.transpose(0, 1)
         
         new_mems = []
         
         # Process through transformer layers
         for layer, mem in zip(self.transformer_layers, mems):
             hidden, new_mem = layer(hidden, mem)
-            new_mems.append(new_mem)
+            new_mems.append(new_mem.detach())  # Detach memory to prevent backprop through memory
+        
+        # Transpose back to [batch, seq_len, d_model]
+        hidden = hidden.transpose(0, 1)
         
         # Output projection
         logits = self.output_layer(hidden)
@@ -144,9 +154,10 @@ class MusicTransformerXL(nn.Module):
         return current_seq
 
 class TransformerXLLayer(nn.Module):
-    def __init__(self, d_model: int, n_head: int, d_ff: int, dropout: float):
+    def __init__(self, d_model: int, n_head: int, d_ff: int, dropout: float, mem_len: int):
         super().__init__()
         
+        self.mem_len = mem_len
         self.attention = nn.MultiheadAttention(d_model, n_head, dropout=dropout)
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
@@ -161,13 +172,19 @@ class TransformerXLLayer(nn.Module):
         )
     
     def forward(self, x, memory=None):
-        # Move memory to same device as input
-        if memory is not None and memory.device != x.device:
+        batch_size = x.size(1)
+        
+        # Handle memory
+        if memory is not None and memory.size(0) > 0:
+            # Ensure memory is on the correct device
             memory = memory.to(x.device)
             
-        # Concatenate memory and current input
-        if memory is not None and memory.size(1) > 0:
-            x = torch.cat([memory, x], dim=1)
+            # Expand memory to match batch size if needed
+            if memory.size(1) != batch_size:
+                memory = memory.expand(-1, batch_size, -1)
+            
+            # Concatenate along sequence dimension
+            x = torch.cat([memory, x], dim=0)
         
         # Self attention
         attended, _ = self.attention(x, x, x)
@@ -176,7 +193,8 @@ class TransformerXLLayer(nn.Module):
         # Feed forward
         x = self.norm2(x + self.dropout(self.ff(x)))
         
-        return x, x
+        # Return the full sequence and the memory for the next iteration
+        return x, x[-self.mem_len:] if x.size(0) > self.mem_len else x
 
     def generate(self,
                 prompt: torch.Tensor,
