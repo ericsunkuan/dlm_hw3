@@ -36,19 +36,15 @@ class RelativePositionalEncoding(nn.Module):
         return self.pe[:, offset:offset + x.size(1)]
 
 class MusicTransformerXL(nn.Module):
-    def __init__(self, 
-                 vocab_size: int,
-                 d_model: int = 512,
-                 n_head: int = 8,
-                 n_layers: int = 6,
-                 d_ff: int = 2048,
-                 dropout: float = 0.1,
-                 mem_len: int = 512):
+    def __init__(self, vocab_size: int, d_model: int = 256, n_head: int = 4,
+                 n_layers: int = 4, d_ff: int = 1024, dropout: float = 0.1,
+                 mem_len: int = 256):
         super().__init__()
         
         self.d_model = d_model
         self.n_head = n_head
         self.mem_len = mem_len
+        self.vocab_size = vocab_size
         
         # Token embedding
         self.token_embedding = nn.Embedding(vocab_size, d_model)
@@ -56,13 +52,8 @@ class MusicTransformerXL(nn.Module):
         
         # Transformer layers
         self.transformer_layers = nn.ModuleList([
-            TransformerXLLayer(
-                d_model=d_model,
-                n_head=n_head,
-                d_ff=d_ff,
-                dropout=dropout,
-                mem_len=mem_len
-            ) for _ in range(n_layers)
+            TransformerXLLayer(d_model, n_head, d_ff, dropout, mem_len)
+            for _ in range(n_layers)
         ])
         
         # Output layer
@@ -82,7 +73,7 @@ class MusicTransformerXL(nn.Module):
             module.weight.data.fill_(1.0)
             
     def forward(self, x, mems=None):
-        batch_size = x.size(0)
+        batch_size, seq_len = x.size()
         
         # Initialize mems if None
         if mems is None:
@@ -101,13 +92,17 @@ class MusicTransformerXL(nn.Module):
         # Process through transformer layers
         for layer, mem in zip(self.transformer_layers, mems):
             hidden, new_mem = layer(hidden, mem)
-            new_mems.append(new_mem.detach())  # Detach memory to prevent backprop through memory
+            new_mems.append(new_mem.detach())
         
         # Transpose back to [batch, seq_len, d_model]
         hidden = hidden.transpose(0, 1)
         
-        # Output projection
+        # Output projection [batch, seq_len, vocab_size]
         logits = self.output_layer(hidden)
+        
+        # Ensure output shape is correct
+        assert logits.size() == (batch_size, seq_len, self.vocab_size), \
+            f"Expected shape {(batch_size, seq_len, self.vocab_size)}, got {logits.size()}"
         
         return logits, new_mems
     
@@ -158,7 +153,7 @@ class TransformerXLLayer(nn.Module):
         super().__init__()
         
         self.mem_len = mem_len
-        self.attention = nn.MultiheadAttention(d_model, n_head, dropout=dropout)
+        self.attention = nn.MultiheadAttention(d_model, n_head, dropout=dropout, batch_first=False)
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
@@ -172,19 +167,19 @@ class TransformerXLLayer(nn.Module):
         )
     
     def forward(self, x, memory=None):
-        batch_size = x.size(1)
+        """
+        x: [seq_len, batch_size, d_model]
+        memory: [mem_len, batch_size, d_model] or None
+        """
+        orig_seq_len = x.size(0)
         
         # Handle memory
         if memory is not None and memory.size(0) > 0:
             # Ensure memory is on the correct device
             memory = memory.to(x.device)
             
-            # Expand memory to match batch size if needed
-            if memory.size(1) != batch_size:
-                memory = memory.expand(-1, batch_size, -1)
-            
             # Concatenate along sequence dimension
-            x = torch.cat([memory, x], dim=0)
+            x = torch.cat([memory, x], dim=0)  # [mem_len + seq_len, batch_size, d_model]
         
         # Self attention
         attended, _ = self.attention(x, x, x)
@@ -193,8 +188,13 @@ class TransformerXLLayer(nn.Module):
         # Feed forward
         x = self.norm2(x + self.dropout(self.ff(x)))
         
-        # Return the full sequence and the memory for the next iteration
-        return x, x[-self.mem_len:] if x.size(0) > self.mem_len else x
+        # Only return the original sequence length for output
+        output = x[-orig_seq_len:]  # [seq_len, batch_size, d_model]
+        
+        # Save the last mem_len tokens for memory
+        new_mem = x[-(self.mem_len + orig_seq_len):-orig_seq_len].detach()  # [mem_len, batch_size, d_model]
+        
+        return output, new_mem
 
     def generate(self,
                 prompt: torch.Tensor,

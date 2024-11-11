@@ -182,32 +182,63 @@ class EnhancedTrainer:
         mems = None
         
         for batch_idx, batch in enumerate(tqdm(self.train_dataloader)):
-            input_ids = batch['input_ids'].to(self.device)
-            labels = batch['labels'].to(self.device)
+            # Clear cache at the start of each batch
+            torch.cuda.empty_cache()
+            
+            # Get batch data
+            input_ids = batch['input_ids'].to(self.device, non_blocking=True)  # [batch_size, seq_len]
+            labels = batch['labels'].to(self.device, non_blocking=True)      # [batch_size, seq_len]
+            
+            batch_size, seq_len = input_ids.size()
             
             # Forward pass
             with torch.amp.autocast('cuda'):
-                logits, mems = self.model(input_ids, mems)
-                loss = self.criterion(logits.reshape(-1, logits.size(-1)), labels.reshape(-1))
+                logits, mems = self.model(input_ids, mems)  # [batch_size, seq_len, vocab_size]
+                
+                # Reshape for loss calculation
+                logits_flat = logits.view(-1, logits.size(-1))    # [batch_size * seq_len, vocab_size]
+                labels_flat = labels.view(-1)                      # [batch_size * seq_len]
+                
+                # Print shapes for debugging
+                if batch_idx == 0:
+                    print(f"Input shape: {input_ids.shape}")
+                    print(f"Labels shape: {labels.shape}")
+                    print(f"Logits shape: {logits.shape}")
+                    print(f"Flattened logits shape: {logits_flat.shape}")
+                    print(f"Flattened labels shape: {labels_flat.shape}")
+                
+                loss = self.criterion(logits_flat, labels_flat)
+                loss = loss / self.gradient_accumulation_steps
             
             # Backward pass
             self.scaler.scale(loss).backward()
             
             if (batch_idx + 1) % self.gradient_accumulation_steps == 0:
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
-                self.optimizer.zero_grad()
+                self.optimizer.zero_grad(set_to_none=True)
                 self.scheduler.step()
+                
+                if mems is not None:
+                    mems = [mem.detach() for mem in mems]
             
-            total_loss += loss.item()
+            total_loss += loss.item() * self.gradient_accumulation_steps
             
             # Log metrics
             if batch_idx % 100 == 0:
                 self.logger.info(f'Epoch {epoch} | Batch {batch_idx} | Loss {loss.item():.4f}')
                 
-            # Clear GPU cache periodically
+            # Clear cache periodically
             if batch_idx % self.empty_cache_freq == 0:
                 torch.cuda.empty_cache()
+                
+            # Optional: break if loss is NaN
+            if torch.isnan(loss):
+                self.logger.error(f"NaN loss detected at batch {batch_idx}")
+                break
         
         return {'loss': total_loss / len(self.train_dataloader)}
     

@@ -1,22 +1,22 @@
 data:
-  batch_size: 8
-  data_dir: "src/data/Pop1K7/midi_analyzed"
-  num_workers: 4
-  max_seq_len: 512
-  overlap: 128
+  batch_size: 2
+  data_dir: "/home/paperspace/dlmusic/hw3/src/data/Pop1K7/midi_analyzed"
+  num_workers: 2
+  max_seq_len: 256
+  overlap: 64
   train_val_split: 0.9
 
 model:
-  d_model: 512
-  n_head: 8
-  n_layers: 6
-  d_ff: 2048
+  d_model: 256
+  n_head: 4
+  n_layers: 4
+  d_ff: 1024
   dropout: 0.1
-  mem_len: 512      # Memory length for transformer-xl
+  mem_len: 256
 
 training:
   epochs: 100
-  gradient_accumulation_steps: 2
+  gradient_accumulation_steps: 4
   eval_every_n_steps: 500
   fp16: true
   gradient_clip_val: 1.0
@@ -31,7 +31,7 @@ training:
   max_grad_norm: 1.0
   weight_decay: 0.01
   pin_memory: true
-  val_batch_size: 32
+  val_batch_size: 2
 
 generation:
   max_length: 2048
