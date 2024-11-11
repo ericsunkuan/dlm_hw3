@@ -2,7 +2,7 @@
 import math
 import torch
 import torch.nn as nn
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict, Tuple, List
 
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model: int, max_len: int = 5000):
@@ -21,160 +21,207 @@ class PositionalEncoding(nn.Module):
         """
         return x + self.pe[:x.size(0)]
 
+class RelativePositionalEncoding(nn.Module):
+    def __init__(self, d_model: int, max_len: int = 1024):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)
+        self.register_buffer('pe', pe)
+        
+    def forward(self, x: torch.Tensor, offset: int = 0) -> torch.Tensor:
+        return self.pe[:, offset:offset + x.size(1)]
+
 class MusicTransformerXL(nn.Module):
     def __init__(self, 
                  vocab_size: int,
                  d_model: int = 512,
                  n_head: int = 8,
-                 n_layers: int = 12,
+                 n_layers: int = 6,
                  d_ff: int = 2048,
                  dropout: float = 0.1,
                  mem_len: int = 512):
         super().__init__()
         
         self.d_model = d_model
+        self.n_head = n_head
         self.mem_len = mem_len
         
         # Token embedding
-        self.embedding = nn.Embedding(vocab_size, d_model)
-        self.pos_encoder = PositionalEncoding(d_model)
+        self.token_embedding = nn.Embedding(vocab_size, d_model)
+        self.dropout = nn.Dropout(dropout)
         
-        # TransformerXL layers
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=n_head,
-            dim_feedforward=d_ff,
-            dropout=dropout,
-            batch_first=True
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        # Transformer layers
+        self.transformer_layers = nn.ModuleList([
+            TransformerXLLayer(
+                d_model=d_model,
+                n_head=n_head,
+                d_ff=d_ff,
+                dropout=dropout
+            ) for _ in range(n_layers)
+        ])
         
         # Output layer
         self.output_layer = nn.Linear(d_model, vocab_size)
         
-        # Initialize memory
-        self.mems = []
-        
-    def init_memory(self, batch_size: int, device: torch.device):
-        """Initialize memory for sequence generation"""
-        self.mems = [torch.zeros(batch_size, self.mem_len, self.d_model, device=device)]
-        
-    def _update_memory(self, hidden: torch.Tensor, mems: torch.Tensor) -> torch.Tensor:
-        """Update memory with current hidden states"""
-        if mems is None:
-            return hidden
-        current_length = hidden.size(1)
-        mem_length = mems.size(1)
-        with torch.no_grad():
-            new_memory = torch.cat([mems, hidden], dim=1)[:, -self.mem_len:]
-        return new_memory
-        
-    def forward(self, 
-                src: torch.Tensor,
-                memory: Optional[torch.Tensor] = None,
-                src_mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            src: Tensor, shape [batch_size, seq_len]
-            memory: Optional tensor for cached memory
-            src_mask: Optional mask for padding
-        """
-        # Embedding and positional encoding
-        x = self.embedding(src) * math.sqrt(self.d_model)
-        x = self.pos_encoder(x.transpose(0, 1)).transpose(0, 1)
-        
-        # Concatenate with memory if provided
-        if memory is not None:
-            x = torch.cat([memory, x], dim=1)
+        # Initialize parameters
+        self.apply(self._init_weights)
+    
+    def _init_weights(self, module):
+        """Initialize the weights"""
+        if isinstance(module, (nn.Linear, nn.Embedding)):
+            module.weight.data.normal_(mean=0.0, std=0.02)
+            if isinstance(module, nn.Linear) and module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.LayerNorm):
+            module.bias.data.zero_()
+            module.weight.data.fill_(1.0)
             
-        # Transform
-        output = self.transformer(x, src_key_padding_mask=src_mask)
+    def forward(self, x, mems=None):
+        # Initialize mems if None
+        if mems is None:
+            mems = [torch.empty(0, device=x.device) for _ in range(len(self.transformer_layers))]
         
-        # Update memory
-        new_memory = self._update_memory(output, memory)
+        # Get embeddings
+        hidden = self.token_embedding(x)
+        hidden = self.dropout(hidden)
         
-        # Get predictions
-        logits = self.output_layer(output)
+        new_mems = []
         
-        return logits, new_memory
+        # Process through transformer layers
+        for layer, mem in zip(self.transformer_layers, mems):
+            hidden, new_mem = layer(hidden, mem)
+            new_mems.append(new_mem)
+        
+        # Output projection
+        logits = self.output_layer(hidden)
+        
+        return logits, new_mems
     
     def generate(self, 
+                input_ids: torch.Tensor, 
+                max_length: int = 1024,
+                temperature: float = 1.0,
+                top_k: int = 50,
+                top_p: float = 0.95):
+        """Generate new tokens"""
+        self.eval()
+        current_seq = input_ids.unsqueeze(0) if input_ids.dim() == 1 else input_ids
+        batch_size = current_seq.size(0)
+        mems = None
+        
+        with torch.no_grad():
+            for _ in range(max_length - current_seq.size(1)):
+                # Get predictions
+                logits, mems = self(current_seq, mems)
+                next_token_logits = logits[:, -1, :] / temperature
+                
+                # Apply top-k filtering
+                if top_k > 0:
+                    indices_to_remove = next_token_logits < torch.topk(next_token_logits, top_k)[0][..., -1, None]
+                    next_token_logits[indices_to_remove] = float('-inf')
+                
+                # Apply top-p (nucleus) filtering
+                if top_p < 1.0:
+                    sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
+                    cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+                    sorted_indices_to_remove = cumulative_probs > top_p
+                    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                    sorted_indices_to_remove[..., 0] = 0
+                    indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                    next_token_logits[indices_to_remove] = float('-inf')
+                
+                # Sample next token
+                probs = torch.softmax(next_token_logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+                
+                # Append to sequence
+                current_seq = torch.cat([current_seq, next_token], dim=1)
+        
+        return current_seq
+
+class TransformerXLLayer(nn.Module):
+    def __init__(self, d_model: int, n_head: int, d_ff: int, dropout: float):
+        super().__init__()
+        
+        self.attention = nn.MultiheadAttention(d_model, n_head, dropout=dropout)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+        
+        # Feed forward network
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, d_ff),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_ff, d_model)
+        )
+    
+    def forward(self, x, memory=None):
+        # Move memory to same device as input
+        if memory is not None and memory.device != x.device:
+            memory = memory.to(x.device)
+            
+        # Concatenate memory and current input
+        if memory is not None and memory.size(1) > 0:
+            x = torch.cat([memory, x], dim=1)
+        
+        # Self attention
+        attended, _ = self.attention(x, x, x)
+        x = self.norm1(x + self.dropout(attended))
+        
+        # Feed forward
+        x = self.norm2(x + self.dropout(self.ff(x)))
+        
+        return x, x
+
+    def generate(self,
                 prompt: torch.Tensor,
                 max_length: int,
                 temperature: float = 1.0,
-                top_k: int = 40) -> torch.Tensor:
-        """
-        Generate sequence from prompt
-        Args:
-            prompt: Starting sequence [batch_size, seq_len]
-            max_length: Maximum length to generate
-            temperature: Sampling temperature
-            top_k: Top-k sampling parameter
-        Returns:
-            Generated sequence [batch_size, seq_len]
-        """
+                top_k: int = 0,
+                top_p: float = 0.9,
+                repetition_penalty: float = 1.2) -> torch.Tensor:
+        """Generate sequence"""
         self.eval()
         current_seq = prompt.clone()
-        batch_size = prompt.size(0)
         
-        print(f"\nStarting generation with:")
-        print(f"- Prompt shape: {prompt.shape}")
-        print(f"- Max length: {max_length}")
-        print(f"- Temperature: {temperature}")
-        print(f"- Top-k: {top_k}")
+        # Reset memories
+        self.memories = [None] * len(self.transformer_layers)
         
         with torch.no_grad():
-            for i in range(max_length - prompt.size(1)):
-                if i % 50 == 0:
-                    print(f"Generating token {i}/{max_length - prompt.size(1)}")
+            for _ in range(max_length - prompt.size(1)):
+                # Get predictions
+                logits, _ = self(current_seq)
+                next_token_logits = logits[:, -1, :] / temperature
                 
-                # Get model predictions for the last token
-                outputs = self(current_seq)
-                # Handle tuple output (logits, mems)
-                if isinstance(outputs, tuple):
-                    logits = outputs[0]  # Get just the logits
-                else:
-                    logits = outputs
+                # Apply repetition penalty
+                if repetition_penalty != 1.0:
+                    for i in range(current_seq.size(1)):
+                        next_token_logits[:, current_seq[:, i]] /= repetition_penalty
                 
-                # Get the last token predictions
-                logits = logits[:, -1, :]  # [batch_size, vocab_size]
-                
-                # Print shape information for debugging
-                # print(f"Logits shape: {logits.shape}")
-                
-                # Apply temperature
-                logits = logits / temperature
-                
-                # Apply top-k sampling
+                # Filter logits
                 if top_k > 0:
-                    v, _ = torch.topk(logits, top_k)
-                    logits[logits < v[:, [-1]]] = float('-inf')
+                    indices_to_remove = next_token_logits < torch.topk(next_token_logits, top_k)[0][..., -1, None]
+                    next_token_logits[indices_to_remove] = float('-inf')
                 
-                # Convert to probabilities
-                probs = torch.softmax(logits, dim=-1)
+                if top_p < 1.0:
+                    sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
+                    cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+                    sorted_indices_to_remove = cumulative_probs > top_p
+                    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                    sorted_indices_to_remove[..., 0] = 0
+                    indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                    next_token_logits[indices_to_remove] = float('-inf')
                 
-                try:
-                    # Sample next token
-                    next_token = torch.multinomial(probs, num_samples=1)  # [batch_size, 1]
-                    
-                    # Append to sequence
-                    current_seq = torch.cat([current_seq, next_token], dim=1)
-                    
-                    # Optional: check for end token
-                    if hasattr(self, 'eos_token_id') and (next_token == self.eos_token_id).any():
-                        break
-                        
-                except Exception as e:
-                    print(f"Error during token generation: {str(e)}")
-                    print(f"Probabilities shape: {probs.shape}")
-                    print(f"Probabilities sum: {probs.sum().item()}")
-                    print(f"Any NaN in probabilities: {torch.isnan(probs).any().item()}")
-                    print(f"Any inf in logits: {torch.isinf(logits).any().item()}")
-                    raise e
+                # Sample next token
+                probs = torch.softmax(next_token_logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
                 
-                # Clear GPU cache periodically
-                if i % 100 == 0:
-                    torch.cuda.empty_cache()
+                # Append to sequence
+                current_seq = torch.cat([current_seq, next_token], dim=1)
         
-        print("Generation complete!")
         return current_seq

@@ -7,7 +7,7 @@ export PYTHONPATH="$PYTHONPATH:$(pwd)"
 # Training configuration
 CONFIG_PATH="configs/model_config.yaml"
 DATA_DIR="src/data/Pop1K7"  # Replace with your dataset path
-DICT_PATH="cache/dictionary.pkl"
+DICT_PATH="cache/basic_event_dictionary.pkl"
 OUTPUT_PATH="output"
 
 # Update data directory in config

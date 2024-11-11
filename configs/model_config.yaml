@@ -1,27 +1,37 @@
 data:
-  batch_size: 64
-  data_dir: src/data/Pop1K7
+  batch_size: 16
+  data_dir: "src/data/Pop1K7/midi_analyzed"
   num_workers: 4
-  sequence_length: 512
-  vocab_size: 512
+  max_seq_len: 512
+  overlap: 128
+  train_val_split: 0.9
 
 model:
   d_model: 512
   n_head: 8
-  n_layers: 12
+  n_layers: 6
   d_ff: 2048
   dropout: 0.1
-  mem_len: 512
+  mem_len: 512      # Memory length for transformer-xl
 
 training:
   epochs: 100
-  eval_every_n_steps: 1000
+  gradient_accumulation_steps: 2
+  eval_every_n_steps: 500
   fp16: true
   gradient_clip_val: 1.0
   learning_rate: 0.0001
   log_every_n_steps: 100
-  save_every_n_steps: 5000
-  warmup_steps: 1000
+  save_every_n_steps: 1000
+  warmup_steps: 100
+  use_gradient_checkpointing: true  # For large models
+  max_steps: 10000
+  save_every: 1000
+  eval_every: 500
+  max_grad_norm: 1.0
+  weight_decay: 0.01
+  pin_memory: true
+  val_batch_size: 32
 
 generation:
   max_length: 2048

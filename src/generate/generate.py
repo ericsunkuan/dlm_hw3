@@ -18,6 +18,7 @@ sys.path.append(str(Path(__file__).parent.parent))
 from model.model import MusicTransformerXL
 from data.preprocessing import MIDIPreprocessor
 from train.setup import create_directory_structure
+import pretty_midi
 
 class MusicGenerator:
     def __init__(self, 
@@ -87,112 +88,93 @@ class MusicGenerator:
         self.model.eval()
         self.logger.info("Model weights loaded successfully")
         
-    def tokens_to_midi(self, tokens: List[int], output_path: str):
-        """Convert token sequence to MIDI file with correct event formatting"""
+    def tokens_to_midi(self, tokens, output_path):
+        """Convert token sequence to MIDI with simplified tempo handling"""
         self.logger.info(f"Converting tokens to MIDI: {output_path}")
         
-        # Create MIDI file
-        midi = miditoolkit.midi.parser.MidiFile()
-        midi.ticks_per_beat = 480  # Standard MIDI resolution
+        # Create PrettyMIDI object with fixed tempo
+        pm = pretty_midi.PrettyMIDI()
+        instrument = pretty_midi.Instrument(program=0)  # Piano
         
-        # Create instrument track (piano by default)
-        instrument = miditoolkit.midi.containers.Instrument(
-            program=0,  # Piano
-            is_drum=False,
-            name='Piano'
-        )
-        
-        # Initialize state variables
-        current_time = 0
-        current_bar = 0
+        current_time = 0.0
+        current_tempo = 120.0  # Default tempo
         current_position = 0
-        current_tempo = 120  # Default tempo
-        current_velocity = 64  # Default velocity
         notes_to_add = []
         
-        # Convert tokens back to events
-        events = [self.word2event[token] for token in tokens]
-        self.logger.info(f"First few events: {events[:10]}")
+        # Add a time signature
+        pm.time_signature_changes.append(
+            pretty_midi.TimeSignature(numerator=4, denominator=4, time=0)
+        )
         
-        # Process events
-        current_note = None
-        for event in events:
-            try:
-                # Bar marker
-                if event == 'Bar_None':
-                    current_bar += 1
-                    current_position = 0
-                    continue
-                    
-                # Position
-                if event.startswith('Position_'):
-                    position_str = event.split('_')[1].replace('/16', '')
-                    current_position = (int(position_str) - 1) / 16
-                    continue
-                    
-                # Note On
-                if event.startswith('Note On_'):
-                    if current_note is not None:
-                        # Add previous note if exists
-                        notes_to_add.append(current_note)
-                    
-                    pitch = int(event.split('_')[1])
-                    current_time = int((current_bar * 4 + current_position) * midi.ticks_per_beat)  # Convert to int
-                    current_note = miditoolkit.midi.containers.Note(
-                        velocity=current_velocity,
-                        pitch=pitch,
-                        start=current_time,
-                        end=current_time  # Will be updated when duration is set
-                    )
-                    
-                # Note Velocity
-                if event.startswith('Note Velocity_'):
-                    current_velocity = int(event.split('_')[1])
-                    if current_note:
-                        current_note.velocity = current_velocity
-                        
-                # Note Duration
-                if event.startswith('Note Duration_'):
-                    if current_note:
-                        duration_index = int(event.split('_')[1])
-                        duration_ticks = int((duration_index + 1) * 120)  # Convert to int
-                        current_note.end = current_time + duration_ticks
-                        notes_to_add.append(current_note)
-                        current_note = None
-                        
-                # Tempo
-                if event.startswith('Tempo Value_'):
-                    tempo_index = int(event.split('_')[1])
-                    current_tempo = 30 + (tempo_index * 2)
-                    midi.tempo_changes.append(
-                        miditoolkit.midi.containers.TempoChange(
-                            tempo=current_tempo,
-                            time=int(current_time)  # Convert to int
-                        )
-                    )
-                    
-            except Exception as e:
-                self.logger.error(f"Error processing event {event}: {str(e)}")
+        for token in tokens:
+            event = self.word2event[token]
+            if '_' not in event:
                 continue
+                
+            event_type, value = event.split('_', 1)
+            
+            if event_type == 'Position':
+                if '/' in value:
+                    num, den = map(int, value.split('/'))
+                    current_position = num / int(den)
+                    # Convert position to time in seconds
+                    bar_duration = 4 * 60.0 / current_tempo  # Length of one bar in seconds
+                    current_time = current_position * bar_duration
+                    
+            elif event_type == 'Note On':
+                try:
+                    pitch = int(value)
+                    if 21 <= pitch <= 108:  # Valid piano range
+                        notes_to_add.append({
+                            'pitch': pitch,
+                            'start': current_time,
+                            'velocity': 64  # Default velocity
+                        })
+                except ValueError:
+                    continue
+                
+            elif event_type == 'Note Duration':
+                if notes_to_add:
+                    try:
+                        duration = float(value) * 60.0 / (current_tempo * 4)  # Convert to seconds
+                        for note in notes_to_add:
+                            note_end = note['start'] + max(0.1, duration)  # Minimum duration
+                            new_note = pretty_midi.Note(
+                                velocity=note['velocity'],
+                                pitch=note['pitch'],
+                                start=note['start'],
+                                end=note_end
+                            )
+                            instrument.notes.append(new_note)
+                    except ValueError:
+                        continue
+                    notes_to_add = []
+                    
+            elif event_type == 'Note Velocity':
+                try:
+                    velocity = min(127, max(1, int(value) * 8))  # Ensure valid MIDI velocity
+                    for note in notes_to_add:
+                        note['velocity'] = velocity
+                except ValueError:
+                    continue
         
-        # Add final note if exists
-        if current_note is not None:
-            notes_to_add.append(current_note)
+        # Add the instrument
+        pm.instruments.append(instrument)
         
-        # Add notes to instrument
-        instrument.notes = notes_to_add
+        # Sort notes by start time
+        for inst in pm.instruments:
+            inst.notes.sort(key=lambda x: x.start)
         
-        # Add instrument to MIDI file
-        midi.instruments = [instrument]
-        
-        # Save MIDI file
-        self.logger.info(f"Saving MIDI file with {len(notes_to_add)} notes")
+        # Write the MIDI file
         try:
-            midi.dump(output_path)
-            self.logger.info(f"Successfully saved MIDI file to {output_path}")
+            pm.write(output_path)
+            self.logger.info(f"Saving MIDI file with {len(instrument.notes)} notes")
         except Exception as e:
-            self.logger.error(f"Error saving MIDI file: {str(e)}")
-            raise
+            self.logger.error(f"Error writing MIDI file: {str(e)}")
+            # Try to save with minimal settings
+            pm = pretty_midi.PrettyMIDI(initial_tempo=120.0)
+            pm.instruments.append(instrument)
+            pm.write(output_path)
         
     def midi_to_wav(self, midi_path: str, wav_path: str):
         """Convert MIDI to WAV using fluidsynth"""
@@ -211,81 +193,58 @@ class MusicGenerator:
         
     def generate_task1(self, 
                   num_samples: int = 20,
-                  temperature: float = 0.95,
-                  top_k: int = 32,
+                  temperature: float = 0.8,    # Lower temperature
+                  top_k: int = 16,             # More focused sampling
                   debug: bool = True):
         """Generate samples for Task 1"""
         self.logger.info("Generating samples for Task 1...")
         
-        # Try one sample first in debug mode
-        if debug:
-            self.logger.info("Running in debug mode - generating one sample")
-            num_samples = 1
+        # Create a simpler prompt
+        base_pattern = [
+            # Bar start
+            self.event2word['Position_1/16'],
+            self.event2word['Note On_60'],  # C4
+            self.event2word['Note Velocity_12'],
+            self.event2word['Note Duration_2'],
+            
+            self.event2word['Position_5/16'],
+            self.event2word['Note On_64'],  # E4
+            self.event2word['Note Velocity_12'],
+            self.event2word['Note Duration_2'],
+            
+            self.event2word['Position_9/16'],
+            self.event2word['Note On_67'],  # G4
+            self.event2word['Note Velocity_12'],
+            self.event2word['Note Duration_2'],
+            
+            self.event2word['Bar_None']
+        ]
         
-        # Directory paths
-        midi_dir = os.path.join(self.output_dir, 'task1', 'midi', f'temp_{temperature}')
-        wav_dir = os.path.join(self.output_dir, 'task1', 'wav', f'temp_{temperature}')
-        os.makedirs(midi_dir, exist_ok=True)
-        os.makedirs(wav_dir, exist_ok=True)
+        # Use a shorter prompt
+        prompt = torch.tensor([base_pattern], device=self.device)
         
-        for i in tqdm(range(num_samples)):
-            try:
-                # Create a more structured prompt with a full bar
-                prompt = torch.tensor([[
-                    # Initialize sequence
-                    self.preprocessor.special_tokens['BOS'],
-                    self.preprocessor.special_tokens['BAR'],
-                    
-                    # Set initial tempo (keep it stable)
-                    self.event2word['Position_1/16'],
-                    self.event2word['Tempo Class_mid'],
-                    self.event2word['Tempo Value_30'],
-                    
-                    # First bar - C major chord
-                    self.event2word['Note On_60'],  # C4
-                    self.event2word['Note Duration_4'],
-                    self.event2word['Position_3/16'],
-                    
-                    self.event2word['Note On_64'],  # E4
-                    self.event2word['Note Duration_4'],
-                    self.event2word['Position_5/16'],
-                    
-                    self.event2word['Note On_67'],  # G4
-                    self.event2word['Note Duration_4'],
-                    self.event2word['Position_7/16'],
-                    
-                    # End first bar
-                    self.preprocessor.special_tokens['BAR'],
-                    
-                    # Start second bar
-                    self.event2word['Position_1/16'],
-                    self.event2word['Note On_65'],  # F4
-                    self.event2word['Note Duration_4'],
-                    self.event2word['Position_3/16'],
-                    
-                    self.event2word['Note On_69'],  # A4
-                    self.event2word['Note Duration_4'],
-                    self.preprocessor.special_tokens['BAR'],
-                ]], device=self.device)
-                
-                # Generate with basic parameters
-                generated = self.model.generate(
-                    prompt=prompt,
-                    max_length=4096,  # Longer sequence
-                    temperature=temperature,
-                    top_k=top_k
-                )
-                
-                # Convert to MIDI
-                midi_path = os.path.join(midi_dir, f'sample_{i+1}.mid')
-                self.tokens_to_midi(generated[0].cpu().tolist(), midi_path)
-                
-            except Exception as e:
-                self.logger.error(f"Error during generation: {str(e)}")
-                if debug:
-                    raise e
-                continue
-
+        try:
+            # Generate with simpler parameters
+            generated = self.model.generate(
+                prompt=prompt,
+                max_length=1024,  # Shorter sequence
+                temperature=temperature,
+                top_k=top_k
+            )
+            
+            # Convert to MIDI
+            midi_path = os.path.join(
+                self.output_dir, 'task1', 'midi', 
+                f'temp_{temperature}', 'sample_1.mid'
+            )
+            os.makedirs(os.path.dirname(midi_path), exist_ok=True)
+            self.tokens_to_midi(generated[0].cpu().tolist(), midi_path)
+            
+        except Exception as e:
+            self.logger.error(f"Error during generation: {str(e)}")
+            if debug:
+                raise e
+        
     def generate_task2(self, 
                       prompt_paths: List[str],
                       temperatures: List[float] = [0.8, 1.0, 1.2],

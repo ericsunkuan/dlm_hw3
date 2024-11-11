@@ -6,3 +6,4 @@ tensorboard>=2.14.0
 pyyaml>=6.0.1
 tqdm>=4.66.1
 pretty_midi
+music21
