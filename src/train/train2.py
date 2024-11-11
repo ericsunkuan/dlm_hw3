@@ -181,31 +181,20 @@ class EnhancedTrainer:
         total_loss = 0
         mems = None
         
+        # Enable async data loading
+        torch.cuda.empty_cache()
+        torch.backends.cudnn.benchmark = True
+        
         for batch_idx, batch in enumerate(tqdm(self.train_dataloader)):
-            # Clear cache at the start of each batch
-            torch.cuda.empty_cache()
+            # Prefetch next batch
+            input_ids = batch['input_ids'].to(self.device, non_blocking=True)
+            labels = batch['labels'].to(self.device, non_blocking=True)
             
-            # Get batch data
-            input_ids = batch['input_ids'].to(self.device, non_blocking=True)  # [batch_size, seq_len]
-            labels = batch['labels'].to(self.device, non_blocking=True)      # [batch_size, seq_len]
-            
-            batch_size, seq_len = input_ids.size()
-            
-            # Forward pass
+            # Forward pass with memory optimization
             with torch.amp.autocast('cuda'):
-                logits, mems = self.model(input_ids, mems)  # [batch_size, seq_len, vocab_size]
-                
-                # Reshape for loss calculation
-                logits_flat = logits.view(-1, logits.size(-1))    # [batch_size * seq_len, vocab_size]
-                labels_flat = labels.view(-1)                      # [batch_size * seq_len]
-                
-                # Print shapes for debugging
-                if batch_idx == 0:
-                    print(f"Input shape: {input_ids.shape}")
-                    print(f"Labels shape: {labels.shape}")
-                    print(f"Logits shape: {logits.shape}")
-                    print(f"Flattened logits shape: {logits_flat.shape}")
-                    print(f"Flattened labels shape: {labels_flat.shape}")
+                logits, mems = self.model(input_ids, mems)
+                logits_flat = logits.view(-1, logits.size(-1))
+                labels_flat = labels.view(-1)
                 
                 loss = self.criterion(logits_flat, labels_flat)
                 loss = loss / self.gradient_accumulation_steps
@@ -227,18 +216,13 @@ class EnhancedTrainer:
             
             total_loss += loss.item() * self.gradient_accumulation_steps
             
-            # Log metrics
-            if batch_idx % 100 == 0:
+            # Log less frequently to reduce overhead
+            if batch_idx % 200 == 0:
                 self.logger.info(f'Epoch {epoch} | Batch {batch_idx} | Loss {loss.item():.4f}')
-                
-            # Clear cache periodically
-            if batch_idx % self.empty_cache_freq == 0:
+            
+            # Clear cache less frequently
+            if batch_idx % (self.empty_cache_freq * 2) == 0:
                 torch.cuda.empty_cache()
-                
-            # Optional: break if loss is NaN
-            if torch.isnan(loss):
-                self.logger.error(f"NaN loss detected at batch {batch_idx}")
-                break
         
         return {'loss': total_loss / len(self.train_dataloader)}
     
